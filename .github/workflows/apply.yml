@@ -1,0 +1,87 @@
+name: apply refresh
+on:
+  workflow_run:
+    workflows: [refresh notes]
+    types: [completed]
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+jobs:
+  apply:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.event != 'pull_request' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the source commit without checking it out
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SRC_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git init -q work
+          git -C work remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          basic=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 --wrap=0)
+          git -C work -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}" \
+            fetch -q --no-tags --depth=1 origin "$SRC_SHA"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: refresh-patch
+          path: ${{ runner.temp }}/refresh
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Stage the patch
+        id: stage
+        working-directory: work
+        env:
+          SRC_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git read-tree "$SRC_SHA"
+          git apply --cached "$RUNNER_TEMP/refresh/changes.patch"
+          if git diff-index --cached --quiet "$SRC_SHA" --; then
+            echo "dirty=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "dirty=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Push the bot branch and open or update its pull request
+        id: pr
+        if: steps.stage.outputs.dirty == 'yes'
+        working-directory: work
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC_SHA: ${{ github.event.workflow_run.head_sha }}
+          BOT_BRANCH: create-pull-request/notes-refresh
+          TARGET: main
+          MSG: "chore: refresh notes stamp"
+        run: |
+          set -euo pipefail
+          git config user.name "sandbox bot"
+          git config user.email "bot@example.invalid"
+          tree=$(git write-tree)
+          commit=$(printf '%s\n' "$MSG" | git commit-tree "$tree" -p "$SRC_SHA")
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -q --force origin "$commit:refs/heads/$BOT_BRANCH"
+          found=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BOT_BRANCH" --base "$TARGET" \
+            --state open --json number --jq 'first(.[].number) // empty')
+          if [ -n "$found" ]; then
+            gh pr edit "$found" --repo "$GITHUB_REPOSITORY" --title "$MSG" --body "$MSG" --add-label dependencies
+            echo "op=updated" >> "$GITHUB_OUTPUT"
+          else
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$TARGET" --head "$BOT_BRANCH" \
+              --title "$MSG" --body "$MSG" --label dependencies)
+            found=${url##*/}
+            echo "op=created" >> "$GITHUB_OUTPUT"
+          fi
+          echo "number=$found" >> "$GITHUB_OUTPUT"
+          echo "picked pull request #$found"
+      - name: Turn on auto-merge
+        if: steps.pr.outputs.op
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr merge --rebase --auto "$NUMBER"
